@@ -1,0 +1,17 @@
+# CI-only overlay, applied on top of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ci.yml ...
+#
+# Local dev publishes fixed host ports (8080 for the proxy, 5432 for Postgres),
+# which is convenient on a laptop but wrong on a shared build agent: Jenkins
+# itself often owns 8080, and two concurrent builds would collide on both
+# ports. So here Postgres is not published at all (nothing outside the compose
+# network needs it) and the proxy gets a random free host port, which the
+# pipeline looks up with `docker compose port proxy 80`.
+services:
+  postgres:
+    ports: !reset []
+
+  proxy:
+    ports: !override
+      - "80"

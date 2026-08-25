@@ -1,0 +1,148 @@
+# Every data-owning service now points at the same `school_db` database with the
+# same credentials, so the tables can reference each other with real foreign
+# keys. The schema itself comes from the shared Flyway migrations in
+# /db/migration, applied once by the `db-migrate` job below; the services then
+# wait for that job to finish and only ever read and write rows. register-service
+# is on this list too now, purely for the idempotency_key table it uses to
+# dedupe retried enroll requests (see IdempotencyKeyStore) -- it still maps no
+# business entities.
+x-db-env: &db-env
+  JWT_SECRET: ${JWT_SECRET}
+  INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+  QUARKUS_DATASOURCE_USERNAME: ${POSTGRES_USER}
+  QUARKUS_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+  QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [school-net]
+
+  # Applies /db/migration to school_db once, then exits. This is the only thing
+  # that changes the schema: the services below wait for it to complete
+  # successfully and run with Flyway disabled, so there is no start-up race and
+  # no chance of two versions of the migrations meeting during a rolling deploy.
+  db-migrate:
+    image: flyway/flyway:11-alpine
+    command: >
+      -url=jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      -user=${POSTGRES_USER}
+      -password=${POSTGRES_PASSWORD}
+      -connectRetries=10
+      -baselineOnMigrate=true
+      migrate
+    volumes:
+      - ./db/migration:/flyway/sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [school-net]
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: auth-service/Dockerfile
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *db-env
+    networks: [school-net]
+
+  student-service:
+    build:
+      context: .
+      dockerfile: student-service/Dockerfile
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *db-env
+    networks: [school-net]
+
+  faculty-service:
+    build:
+      context: .
+      dockerfile: faculty-service/Dockerfile
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *db-env
+    networks: [school-net]
+
+  classes-service:
+    build:
+      context: .
+      dockerfile: classes-service/Dockerfile
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      faculty-service:
+        condition: service_started
+    environment:
+      <<: *db-env
+    networks: [school-net]
+
+  schedule-service:
+    build:
+      context: .
+      dockerfile: schedule-service/Dockerfile
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *db-env
+    networks: [school-net]
+
+  register-service:
+    build:
+      context: .
+      dockerfile: register-service/Dockerfile
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      student-service:
+        condition: service_started
+      classes-service:
+        condition: service_started
+      schedule-service:
+        condition: service_started
+    environment:
+      <<: *db-env
+    networks: [school-net]
+
+  proxy:
+    build:
+      context: .
+      dockerfile: proxy/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      - auth-service
+      - student-service
+      - faculty-service
+      - classes-service
+      - schedule-service
+      - register-service
+    networks: [school-net]
+
+networks:
+  school-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
